@@ -258,9 +258,8 @@ class _PassportDataset(torch.utils.data.Dataset):
         self._lazy_init()
         path = self.paths[idx]
         pid = passport_id_from_path(path, self.root)
-        try:
-            img = np.array(Image.open(path).convert("RGB"))
-        except Exception:
+        img = _read_image_robust(path)
+        if img is None:
             return pid, None
         try:
             bboxes, kpss = self._det.detect(img[:, :, ::-1], metric="default")
@@ -354,6 +353,35 @@ class FaceEmbedder:
 # ════════════════════════════════════════════════════════════════════════════
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
+
+def _read_image_robust(path: Path) -> np.ndarray | None:
+    """Try PIL, then OpenCV — handles many TIF variants (LZW, JPEG-in-TIFF,
+    multi-page, 16-bit grayscale) that PIL alone refuses to decode.
+
+    Returns RGB uint8 (H, W, 3) or None if every backend fails.
+    """
+    # PIL — fastest for standard formats
+    try:
+        return np.array(Image.open(path).convert("RGB"))
+    except Exception:
+        pass
+    # OpenCV — handles JPEG-in-TIFF, LZW, packbits, etc. that PIL chokes on
+    try:
+        import cv2
+        bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if bgr is not None:
+            return bgr[:, :, ::-1].copy()
+    except Exception:
+        pass
+    # Multi-page TIF: try first page explicitly via PIL's seek
+    try:
+        with Image.open(path) as im:
+            im.seek(0)
+            return np.array(im.convert("RGB"))
+    except Exception:
+        pass
+    return None
 
 
 def discover_passports(root: Path) -> list[Path]:
@@ -643,6 +671,7 @@ def build_summary(
     n_failed: int,
     candidates: list[tuple[tuple[str, str], float]],
     threshold: float,
+    capped_at: int | None = None,
 ) -> dict:
     summary = {
         "input_images_found": n_input,
@@ -652,6 +681,8 @@ def build_summary(
         "fraud_threshold": threshold,
         "candidate_pairs": len(candidates),
     }
+    if capped_at is not None:
+        summary["candidate_pairs_capped_at"] = capped_at
     if candidates:
         cosines = np.array([sc for _, sc in candidates], dtype=np.float32)
         summary.update({
@@ -681,10 +712,17 @@ def main() -> int:
                    help="AdaFace IR-101 .pt path (bundled with repo)")
     p.add_argument("--scrfd-model", type=Path, default=Path(DEFAULT_SCRFD),
                    help="SCRFD det_10g.onnx path (bundled with repo)")
-    p.add_argument("--threshold", type=float, default=0.20,
-                   help="Cosine threshold for fraud candidates (calibrate on labelled prod sample)")
+    p.add_argument("--threshold", type=float, default=0.30,
+                   help="Cosine threshold for fraud candidates. At 40k+ scale, 0.20 "
+                        "produces unactionable noise (10⁵+ pairs). Start with 0.30, "
+                        "raise to 0.35-0.40 if the candidate list is still too large.")
     p.add_argument("--top-k", type=int, default=20,
                    help="Top-K nearest neighbours per passport")
+    p.add_argument("--max-candidates", type=int, default=2000,
+                   help="Cap on candidate pairs written + image-copied. The full "
+                        "above-threshold set is logged for traceability, but only "
+                        "the top --max-candidates by cosine are materialized as "
+                        "image copies / Excel rows.")
     p.add_argument("--device", default="cuda",
                    help="cuda or cpu")
     p.add_argument("--det-size", type=int, default=640,
@@ -751,15 +789,23 @@ def main() -> int:
 
     indices, scores = build_index_and_query(emb, args.top_k, args.output)
 
-    candidates = collect_candidates(pids, indices, scores, args.threshold)
+    candidates_full = collect_candidates(pids, indices, scores, args.threshold)
+    print(f"[candidates] {len(candidates_full)} pairs above cosine {args.threshold}")
+    if len(candidates_full) > args.max_candidates:
+        print(f"[candidates] capping at top {args.max_candidates} by cosine "
+              f"(use --max-candidates to change)")
+    candidates = candidates_full[: args.max_candidates]
 
     review_dir = args.output / "fraud_candidates"
     rows = copy_candidate_images(candidates, image_paths, review_dir)
     print(f"[out] {len(rows)} suspect-pair image copies -> {review_dir}")
 
     write_candidates_csv(rows, args.output / "candidates.csv")
-    summary = build_summary(len(paths), len(pids),
-                             len(paths) - len(pids), candidates, args.threshold)
+    summary = build_summary(
+        len(paths), len(pids), len(paths) - len(pids),
+        candidates_full, args.threshold,
+        capped_at=args.max_candidates if len(candidates_full) > args.max_candidates else None,
+    )
     write_candidates_xlsx(rows, summary, args.output / "candidates.xlsx")
 
     summary_txt = "\n".join(f"{k}: {v}" for k, v in summary.items())
