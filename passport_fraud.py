@@ -29,6 +29,15 @@ Usage:
     pip install -r requirements.txt
     python passport_fraud.py                          # uses defaults
     python passport_fraud.py --input /path/to/dir --threshold 0.20
+    python passport_fraud.py --workers 16 --batch-size 256 --fp16   # A100 prod
+
+Speed knobs (default tuned for an RTX 4070 Super-class GPU):
+    --workers       N CPU worker processes for image decode + SCRFD detection.
+                    Scale up to ~min(CPU cores - 2, 16) for big A100 boxes.
+    --batch-size    AdaFace inference batch size. 128 is conservative; on A100
+                    80 GB you can push 256-1024. Each sample is ~30 MB activation.
+    --fp16          Run AdaFace in FP16 autocast on GPU (A100/H100/4090 only).
+                    ~2× faster, no measurable accuracy loss for inference.
 
 Outputs (under --output):
     candidates.xlsx          Excel: rank, cosine, file names, paths (sortable)
@@ -199,22 +208,97 @@ def load_adaface_ir101(weights_path: Path, device: torch.device) -> _IR101Backbo
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Detection + embedding pipeline
+# Detection + embedding pipeline (multi-worker, batched, optional FP16)
 # ════════════════════════════════════════════════════════════════════════════
 
-@dataclass
-class _DetectedFace:
-    embedding: np.ndarray
-    bbox: np.ndarray
-    det_score: float
-    landmarks: np.ndarray
+# A100-class GPUs leave most of their VRAM idle if we run images one-by-one.
+# Architecture:
+#   - DataLoader with N CPU workers, each running its own SCRFD ONNX session
+#     (CPU EP, threadsafe, no GPU contention). Each __getitem__ returns the
+#     aligned 112×112 face crop as uint8 — or None if no face was detected.
+#   - Main thread pulls batches of crops, transfers them to GPU as one tensor,
+#     and runs AdaFace IR-101 in a single big batch (optional FP16 autocast).
+#
+# This pattern keeps the GPU busy while CPUs decode/detect in parallel.
+
+
+class _PassportDataset(torch.utils.data.Dataset):
+    """Per-image: PIL decode → SCRFD detect → ArcFace template align → 112×112 crop.
+
+    Each worker lazily creates its own SCRFD ONNX session (CPU EP) and reuses it
+    for every image it processes. Returning None on failure keeps the
+    main loop's accounting simple.
+    """
+
+    def __init__(self, paths: list[Path], root: Path, scrfd_path: str,
+                 det_size: tuple[int, int], det_threshold: float):
+        self.paths = paths
+        self.root = root
+        self.scrfd_path = scrfd_path
+        self.det_size = det_size
+        self.det_threshold = det_threshold
+        self._det = None
+        self._face_align = None
+
+    def _lazy_init(self) -> None:
+        if self._det is not None:
+            return
+        from insightface.model_zoo.scrfd import SCRFD
+        from insightface.utils import face_align
+        self._det = SCRFD(model_file=self.scrfd_path)
+        # ctx_id=-1 forces CPU EP — workers must NOT touch CUDA (forked processes
+        # share no CUDA context with the main process)
+        self._det.prepare(ctx_id=-1, input_size=self.det_size)
+        self._face_align = face_align
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, idx: int):
+        self._lazy_init()
+        path = self.paths[idx]
+        pid = passport_id_from_path(path, self.root)
+        try:
+            img = np.array(Image.open(path).convert("RGB"))
+        except Exception:
+            return pid, None
+        try:
+            bboxes, kpss = self._det.detect(img[:, :, ::-1], metric="default")
+        except Exception:
+            return pid, None
+        if bboxes is None or len(bboxes) == 0:
+            return pid, None
+        scores = bboxes[:, 4]
+        sizes = (bboxes[:, 2] - bboxes[:, 0]) * (bboxes[:, 3] - bboxes[:, 1])
+        valid = scores >= self.det_threshold
+        if not valid.any():
+            return pid, None
+        idxs = np.where(valid)[0]
+        best = idxs[int(np.argmax(sizes[valid]))]
+        kps = kpss[best]
+        aligned_bgr = self._face_align.norm_crop(img[:, :, ::-1],
+                                                  landmark=kps, image_size=112)
+        # Return as RGB uint8 (B,H,W,3); main thread will permute and normalize on GPU
+        return pid, aligned_bgr[:, :, ::-1].copy()
+
+
+def _collate(batch):
+    """List[(pid, face|None)] → (pids, faces_array|None, valid_mask)."""
+    pids = [b[0] for b in batch]
+    faces = [b[1] for b in batch]
+    valid_mask = np.array([f is not None for f in faces], dtype=bool)
+    if not valid_mask.any():
+        return pids, None, valid_mask
+    valid_faces = [f for f in faces if f is not None]
+    arr = np.stack(valid_faces, axis=0)  # (B, 112, 112, 3) uint8
+    return pids, arr, valid_mask
 
 
 class FaceEmbedder:
-    """SCRFD detection + ArcFace alignment + AdaFace IR-101 embedding.
+    """Holds AdaFace IR-101 on GPU + the SCRFD model path workers will use.
 
-    Loads SCRFD directly from a local ONNX file (only det_10g.onnx is needed,
-    not the full InsightFace buffalo_l package) and AdaFace from a local .pt.
+    The detection step runs in DataLoader workers (CPU EP); the embedding step
+    runs on the main process's CUDA device with whatever batch size fits.
     """
 
     def __init__(
@@ -224,60 +308,45 @@ class FaceEmbedder:
         det_size: tuple[int, int] = (640, 640),
         det_score_threshold: float = 0.4,
         device: str = "cuda",
+        fp16: bool = False,
     ):
-        from insightface.model_zoo.scrfd import SCRFD
-
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        self.det_score_threshold = det_score_threshold
+        self.det_threshold = det_score_threshold
+        self.det_size = det_size
+        self.fp16 = fp16 and self.device.type == "cuda"
 
         _verify_bundled(scrfd_model_path, "SCRFD det_10g.onnx", min_size_mb=10)
         _verify_bundled(adaface_weights_path, "AdaFace IR-101 .pt",
                         min_size_mb=200, download_url=_ADAFACE_RELEASE_URL)
+        self.scrfd_path = str(scrfd_model_path)
 
-        self._det = SCRFD(model_file=str(scrfd_model_path))
-        ctx_id = 0 if self.device.type == "cuda" else -1
-        self._det.prepare(ctx_id=ctx_id, input_size=det_size)
+        self.model = load_adaface_ir101(adaface_weights_path, self.device)
 
-        self._model = load_adaface_ir101(adaface_weights_path, self.device)
+        # Warm up CUDA kernels with a single forward pass — first call is slow
+        # because of cuBLAS/cuDNN autotuning
+        if self.device.type == "cuda":
+            with torch.no_grad():
+                dummy = torch.zeros(1, 3, 112, 112, device=self.device)
+                if self.fp16:
+                    with torch.amp.autocast("cuda", dtype=torch.float16):
+                        self.model(dummy)
+                else:
+                    self.model(dummy)
+            torch.cuda.synchronize()
 
-    def _detect(self, img_rgb: np.ndarray):
-        """Returns list of (bbox, score, kps) tuples for faces above threshold."""
-        bboxes, kpss = self._det.detect(img_rgb[:, :, ::-1], metric="default")
-        if bboxes is None or len(bboxes) == 0:
-            return []
-        out = []
-        for i in range(bboxes.shape[0]):
-            score = float(bboxes[i, 4])
-            if score < self.det_score_threshold:
-                continue
-            out.append((bboxes[i, :4], score, kpss[i]))
-        return out
-
-    def _largest_face(self, faces):
-        if not faces:
-            return None
-        return max(faces, key=lambda f: (f[0][2] - f[0][0]) * (f[0][3] - f[0][1]))
-
-    def embed(self, img_rgb: np.ndarray) -> _DetectedFace | None:
-        from insightface.utils import face_align
-        face = self._largest_face(self._detect(img_rgb))
-        if face is None:
-            return None
-        bbox, score, kps = face
-        aligned_bgr = face_align.norm_crop(img_rgb[:, :, ::-1], landmark=kps, image_size=112)
-        aligned_rgb = aligned_bgr[:, :, ::-1].copy()
-        x = torch.from_numpy(aligned_rgb[None]).to(self.device)
+    def embed_batch(self, faces_uint8: np.ndarray) -> np.ndarray:
+        """(B, 112, 112, 3) uint8 RGB → (B, 512) float32, L2-normalized."""
+        x = torch.from_numpy(faces_uint8).to(self.device, non_blocking=True)
         x = x.permute(0, 3, 1, 2).float() / 255.0
         x = (x - 0.5) / 0.5
         with torch.no_grad():
-            emb = self._model(x)
-            emb = F.normalize(emb, p=2, dim=1)
-        return _DetectedFace(
-            embedding=emb[0].cpu().numpy().astype(np.float32),
-            bbox=bbox,
-            det_score=score,
-            landmarks=kps,
-        )
+            if self.fp16:
+                with torch.amp.autocast("cuda", dtype=torch.float16):
+                    emb = self.model(x)
+            else:
+                emb = self.model(x)
+            emb = F.normalize(emb.float(), p=2, dim=1)
+        return emb.cpu().numpy().astype(np.float32)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -304,41 +373,65 @@ def passport_id_from_path(path: Path, root: Path) -> str:
     return str(rel).replace(os.sep, "__")
 
 
-def extract_all(paths: list[Path], root: Path, embedder: FaceEmbedder, out_dir: Path):
-    """Embed every image; write embeddings.npy, passport_ids.txt, failed_detection.txt."""
+def extract_all(
+    paths: list[Path],
+    root: Path,
+    embedder: FaceEmbedder,
+    out_dir: Path,
+    workers: int = 8,
+    batch_size: int = 128,
+) -> tuple[np.ndarray, list[str]]:
+    """Multi-worker extraction. Workers do PIL+SCRFD on CPU; main GPU-batches AdaFace.
+
+    Workers run SCRFD on CPU EP (the ONNX model is small, 17 MB, fast on CPU and
+    parallelizes cleanly across processes). The main thread aggregates aligned
+    crops, ships them to GPU as a single tensor per batch, and runs AdaFace
+    once per batch.
+    """
+    dataset = _PassportDataset(
+        paths, root, embedder.scrfd_path, embedder.det_size, embedder.det_threshold,
+    )
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=workers,
+        collate_fn=_collate,
+        pin_memory=False,                  # we do our own .to(device) below
+        persistent_workers=workers > 0,
+        prefetch_factor=2 if workers > 0 else None,
+    )
+
     embeddings: list[np.ndarray] = []
-    pids: list[str] = []
+    pids_ok: list[str] = []
     failed: list[str] = []
     t0 = time.time()
-    for path in tqdm(paths, desc="embedding"):
-        pid = passport_id_from_path(path, root)
-        try:
-            img = np.array(Image.open(path).convert("RGB"))
-        except Exception as exc:
-            print(f"[skip] {pid}: cannot read image — {exc}")
-            failed.append(pid)
-            continue
-        try:
-            res = embedder.embed(img)
-        except Exception as exc:
-            print(f"[skip] {pid}: embed error — {exc}")
-            traceback.print_exc()
-            failed.append(pid)
-            continue
-        if res is None:
-            failed.append(pid)
-            continue
-        embeddings.append(res.embedding)
-        pids.append(pid)
-    elapsed = time.time() - t0
-    print(f"[embed] {len(embeddings)} OK / {len(failed)} failed in {elapsed:.1f}s "
-          f"({elapsed / max(1, len(paths)) * 1000:.1f} ms/img)")
+    n_total = len(paths)
 
-    emb_arr = np.stack(embeddings, 0).astype(np.float32) if embeddings else np.zeros((0, 512), np.float32)
+    pbar = tqdm(total=n_total, desc="embedding", unit="img")
+    for pids_batch, faces_arr, valid_mask in loader:
+        for pid, ok in zip(pids_batch, valid_mask):
+            if not ok:
+                failed.append(pid)
+        if faces_arr is not None:
+            emb = embedder.embed_batch(faces_arr)
+            valid_pids = [pid for pid, ok in zip(pids_batch, valid_mask) if ok]
+            for j, pid in enumerate(valid_pids):
+                embeddings.append(emb[j])
+                pids_ok.append(pid)
+        pbar.update(len(pids_batch))
+    pbar.close()
+
+    elapsed = time.time() - t0
+    rate = n_total / max(0.001, elapsed)
+    print(f"[embed] {len(embeddings)} OK / {len(failed)} failed in {elapsed:.1f}s "
+          f"({elapsed / max(1, n_total) * 1000:.1f} ms/img, {rate:.0f} img/s)")
+
+    emb_arr = (np.stack(embeddings, 0).astype(np.float32)
+               if embeddings else np.zeros((0, 512), np.float32))
     np.save(out_dir / "embeddings.npy", emb_arr)
-    (out_dir / "passport_ids.txt").write_text("\n".join(pids))
+    (out_dir / "passport_ids.txt").write_text("\n".join(pids_ok))
     (out_dir / "failed_detection.txt").write_text("\n".join(failed))
-    return emb_arr, pids
+    return emb_arr, pids_ok
 
 
 def build_index_and_query(emb: np.ndarray, top_k: int, out_dir: Path):
@@ -596,6 +689,12 @@ def main() -> int:
                    help="cuda or cpu")
     p.add_argument("--det-size", type=int, default=640,
                    help="SCRFD detection input size (square)")
+    p.add_argument("--workers", type=int, default=8,
+                   help="DataLoader worker processes for PIL decode + SCRFD detection")
+    p.add_argument("--batch-size", type=int, default=128,
+                   help="AdaFace embedding batch size on GPU")
+    p.add_argument("--fp16", action="store_true",
+                   help="Run AdaFace in FP16 autocast on GPU (A100/H100: ~2× faster)")
     p.add_argument("--no-html", action="store_true",
                    help="Skip HTML viewer rendering (default: render it)")
     p.add_argument("--no-resume", action="store_true",
@@ -632,13 +731,19 @@ def main() -> int:
         cached_pids = None
 
     if cached_pids is None:
+        print(f"[info] workers={args.workers} batch_size={args.batch_size} "
+              f"fp16={args.fp16}")
         embedder = FaceEmbedder(
             adaface_weights_path=args.adaface_weights,
             scrfd_model_path=args.scrfd_model,
             det_size=(args.det_size, args.det_size),
             device=args.device,
+            fp16=args.fp16,
         )
-        emb, pids = extract_all(paths, args.input, embedder, args.output)
+        emb, pids = extract_all(
+            paths, args.input, embedder, args.output,
+            workers=args.workers, batch_size=args.batch_size,
+        )
 
     if emb.shape[0] < 2:
         print(f"[warn] only {emb.shape[0]} usable embedding(s); cannot pair-search")
