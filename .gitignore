@@ -6,6 +6,10 @@ __pycache__/
 output/
 .ipynb_checkpoints/
 
+# AdaFace weights (download separately — see README)
+*.pt
+checkpoints/
+
 # Outputs (user can produce these by running the script)
 output/index.faiss
 output/embeddings.npy

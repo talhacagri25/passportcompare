@@ -11,11 +11,19 @@ Pipeline:
     4. FAISS IndexFlatIP (cosine = inner product on unit vectors)
     5. Top-K nearest neighbours per passport, threshold-filtered candidates
 
-Models are bundled with this repository (no internet required at runtime):
-    - SCRFD detector: models/buffalo_l/det_10g.onnx       (~17 MB)
-    - AdaFace IR-101: checkpoints/adaface_ir101_webface12m.pt  (~250 MB, Git LFS)
+Models are bundled with this repository, except the 250 MB AdaFace weights file
+which lives as a GitHub release asset:
 
-If you cloned without LFS, run `git lfs install && git lfs pull` first.
+    SCRFD detector:    models/buffalo_l/det_10g.onnx                (~17 MB, in repo)
+    AdaFace IR-101:    checkpoints/adaface_ir101_webface12m.pt      (~250 MB, release asset)
+
+Download the AdaFace weights once on the prod server (one-time, ~250 MB):
+
+    mkdir -p checkpoints
+    wget -O checkpoints/adaface_ir101_webface12m.pt \
+      https://github.com/talhacagri25/passportcompare/releases/download/v1.0/adaface_ir101_webface12m.pt
+
+After that, no internet is required at runtime.
 
 Usage:
     pip install -r requirements.txt
@@ -151,19 +159,27 @@ class _IR101Backbone(Module):
 # Weight loading — strictly local, no network
 # ════════════════════════════════════════════════════════════════════════════
 
-def _verify_bundled(path: Path, label: str, min_size_mb: int) -> Path:
+_ADAFACE_RELEASE_URL = (
+    "https://github.com/talhacagri25/passportcompare/releases/download/"
+    "v1.0/adaface_ir101_webface12m.pt"
+)
+
+
+def _verify_bundled(path: Path, label: str, min_size_mb: int,
+                    download_url: str | None = None) -> Path:
     if not path.exists():
-        raise FileNotFoundError(
-            f"{label} not found at {path}. "
-            "If you cloned this repo without Git LFS, run:\n"
-            "    git lfs install && git lfs pull\n"
-            "Otherwise verify the file is at the expected path."
-        )
+        msg = f"{label} not found at {path}."
+        if download_url:
+            msg += (f"\n\nDownload the file once with:\n"
+                    f"    mkdir -p {path.parent}\n"
+                    f"    wget -O {path} \\\n"
+                    f"        {download_url}\n")
+        raise FileNotFoundError(msg)
     size_mb = path.stat().st_size / (1024 * 1024)
     if size_mb < min_size_mb:
         raise ValueError(
-            f"{label} at {path} looks truncated ({size_mb:.1f} MB; expected ≥{min_size_mb} MB). "
-            "Likely a Git LFS pointer file — run `git lfs pull` to materialize the real weights."
+            f"{label} at {path} looks truncated ({size_mb:.1f} MB; "
+            f"expected ≥{min_size_mb} MB). Re-download the file."
         )
     return path
 
@@ -215,7 +231,8 @@ class FaceEmbedder:
         self.det_score_threshold = det_score_threshold
 
         _verify_bundled(scrfd_model_path, "SCRFD det_10g.onnx", min_size_mb=10)
-        _verify_bundled(adaface_weights_path, "AdaFace IR-101 .pt", min_size_mb=200)
+        _verify_bundled(adaface_weights_path, "AdaFace IR-101 .pt",
+                        min_size_mb=200, download_url=_ADAFACE_RELEASE_URL)
 
         self._det = SCRFD(model_file=str(scrfd_model_path))
         ctx_id = 0 if self.device.type == "cuda" else -1

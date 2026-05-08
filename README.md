@@ -6,27 +6,22 @@ candidate pairs where the same person appears under different passport identitie
 
 ## Setup
 
-The model weights are bundled in this repository via Git LFS. On a fresh server:
-
 ```bash
-# 1) Install git-lfs once (Ubuntu/Debian)
-sudo apt-get install -y git-lfs
+# 1) Clone the repo (SCRFD detector ships with it, ~17 MB)
+git clone https://github.com/talhacagri25/passportcompare.git
+cd passportcompare
 
-# 2) Clone with LFS files
-git lfs install
-git clone <this-repo>
-cd <repo>
-git lfs pull   # pulls the 250 MB AdaFace .pt; harmless if already present
+# 2) Download AdaFace IR-101 weights (~250 MB, one-time)
+mkdir -p checkpoints
+wget -O checkpoints/adaface_ir101_webface12m.pt \
+  https://github.com/talhacagri25/passportcompare/releases/download/v1.0/adaface_ir101_webface12m.pt
 
 # 3) Install Python deps
 pip install -r requirements.txt
 ```
 
-No internet is required at runtime — both detector and embedder load from local
-files (`models/buffalo_l/det_10g.onnx` and `checkpoints/adaface_ir101_webface12m.pt`).
-
-If `git lfs pull` is skipped, the script will exit with a clear error explaining how
-to fix it.
+After step 2, no further network access is required at runtime. If the .pt file
+is missing the script exits with a clear error showing the wget command above.
 
 ## Run
 
