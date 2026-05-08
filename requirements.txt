@@ -1,0 +1,9 @@
+torch>=2.0
+numpy
+pillow
+opencv-python
+insightface>=0.7
+onnxruntime-gpu
+faiss-cpu
+tqdm
+openpyxl

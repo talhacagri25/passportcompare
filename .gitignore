@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+.idea/
+.vscode/
+output/
+.ipynb_checkpoints/
+
+# Outputs (user can produce these by running the script)
+output/index.faiss
+output/embeddings.npy
